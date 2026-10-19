@@ -562,27 +562,151 @@ fn guard_instance_key(guard: &ScAddress) -> LedgerKey {
     })
 }
 
-/// `__check_auth` reads/writes the guard's own storage — policy, rolling
-/// window, heartbeat clock, admin freeze — plus its instance keys. The
-/// auth-less preflight never executes `__check_auth`, so those keys are
-/// missing from the simulated footprint; without them the enforced
-/// re-simulation cannot run. Merge them in (as read-write; the engine only
-/// writes what it must).
-fn merge_guard_footprint(mut fp: LedgerFootprint, guard: &ScAddress) -> LedgerFootprint {
-    let extra = [
-        guard_data_key(guard, "Policy"),
-        guard_data_key(guard, "Window"),
-        guard_data_key(guard, "LastHeartbeat"),
-        guard_data_key(guard, "AdminFrozen"),
-        guard_instance_key(guard),
-    ];
-    let mut rw: Vec<LedgerKey> = fp.read_write.iter().cloned().collect();
-    for k in extra {
-        if !rw.contains(&k) {
-            rw.push(k);
+/// The kind of call being performed, determining which guard storage keys are read-write vs read-only.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CallKind {
+    /// Token spend/transfer authorized through `__check_auth`. Writes `Window`; reads `Policy`, `AdminFrozen`, `LastHeartbeat`.
+    Transfer,
+    /// DMS heartbeat invocation. Writes `LastHeartbeat`; reads `Policy`, `Window`, `AdminFrozen`.
+    Heartbeat,
+    /// Diagnostic / verification call. Writes only instance TTL, reads all guard keys.
+    ReadOnly,
+}
+
+/// Target key in contract storage.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum StorageTarget {
+    Persistent(&'static str),
+    Instance,
+}
+
+impl StorageTarget {
+    fn to_ledger_key(self, guard: &ScAddress) -> LedgerKey {
+        match self {
+            Self::Persistent(name) => guard_data_key(guard, name),
+            Self::Instance => guard_instance_key(guard),
         }
     }
-    fp.read_write = VecM::try_from(rw).expect("footprint bound");
+}
+
+/// Declarative specification of when a storage key is written vs read-only.
+///
+/// This single declarative mapping derives the footprint split across all call kinds
+/// without duplicating key lists or hardcoding separate read/write branches.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WriteCondition {
+    /// Always declared read-write (e.g. the contract instance key, on which the engine may bump/write TTL).
+    Always,
+    /// Never written during agent-initiated invocations (e.g. Policy and AdminFrozen are read-only for agent transactions; only admin calls write them).
+    Never,
+    /// Written on spend/transfer operations (e.g. Window rolling spend ledger).
+    OnTransfer,
+    /// Written on heartbeat operations (e.g. LastHeartbeat timestamp).
+    OnHeartbeat,
+}
+
+impl WriteCondition {
+    fn is_written(&self, kind: CallKind) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::OnTransfer => kind == CallKind::Transfer,
+            Self::OnHeartbeat => kind == CallKind::Heartbeat,
+        }
+    }
+}
+
+struct StorageKeyTouch {
+    target: StorageTarget,
+    written_on: WriteCondition,
+}
+
+/// Single declarative map of guard storage keys to when they are written.
+///
+/// Cross-reference: Core ABI storage-touch specification (issue #354 / SPEC §1.1).
+/// - Policy: read by all invocations for policy rules / DMS grace, never written by agent calls.
+/// - AdminFrozen: read by all invocations to check account kill-switch, never written by agent calls.
+/// - Window: rolling spend ledger; read by all calls, written only on transfer/transfer-from spend.
+/// - LastHeartbeat: agent liveness timestamp; read by transfers to enforce DMS, written by heartbeat.
+/// - Instance: contains contract instance, admin, and agent pubkey; declared read-write as engine may write TTL.
+const GUARD_STORAGE_TOUCHES: &[StorageKeyTouch] = &[
+    StorageKeyTouch {
+        target: StorageTarget::Persistent("Policy"),
+        written_on: WriteCondition::Never,
+    },
+    StorageKeyTouch {
+        target: StorageTarget::Persistent("AdminFrozen"),
+        written_on: WriteCondition::Never,
+    },
+    StorageKeyTouch {
+        target: StorageTarget::Persistent("Window"),
+        written_on: WriteCondition::OnTransfer,
+    },
+    StorageKeyTouch {
+        target: StorageTarget::Persistent("LastHeartbeat"),
+        written_on: WriteCondition::OnHeartbeat,
+    },
+    StorageKeyTouch {
+        target: StorageTarget::Instance,
+        written_on: WriteCondition::Always,
+    },
+];
+
+/// The guard storage keys `__check_auth` reads and writes, partitioned by `CallKind`.
+///
+/// Keys the call kind writes are declared `read_write`; keys it only reads are declared
+/// `read_only` (plus the instance key, which the engine may write TTL on).
+///
+/// Declaring read-only keys in `read_only` rather than `read_write` avoids charging the
+/// fund-holding account write-rent and higher resource fees for keys that are only read.
+fn guard_footprint(guard: &ScAddress, kind: CallKind) -> LedgerFootprint {
+    let mut read_only = Vec::new();
+    let mut read_write = Vec::new();
+
+    for touch in GUARD_STORAGE_TOUCHES {
+        let key = touch.target.to_ledger_key(guard);
+        if touch.written_on.is_written(kind) {
+            read_write.push(key);
+        } else {
+            read_only.push(key);
+        }
+    }
+
+    LedgerFootprint {
+        read_only: VecM::try_from(read_only).expect("read_only footprint bound"),
+        read_write: VecM::try_from(read_write).expect("read_write footprint bound"),
+    }
+}
+
+/// Merges guard storage keys into the simulated footprint, derived from `GUARD_STORAGE_TOUCHES`.
+///
+/// The RPC's preflight runs in recording mode and never executes `__check_auth`,
+/// so guard storage keys are absent from the simulated footprint. This function
+/// merges them in according to `CallKind`:
+/// - Keys written by `kind` are placed in `read_write` (and removed from `read_only` if present).
+/// - Keys only read by `kind` are placed in `read_only` (unless already present in `read_write`).
+fn merge_guard_footprint(
+    mut fp: LedgerFootprint,
+    guard: &ScAddress,
+    kind: CallKind,
+) -> LedgerFootprint {
+    let mut ro: Vec<LedgerKey> = fp.read_only.iter().cloned().collect();
+    let mut rw: Vec<LedgerKey> = fp.read_write.iter().cloned().collect();
+
+    for touch in GUARD_STORAGE_TOUCHES {
+        let key = touch.target.to_ledger_key(guard);
+        if touch.written_on.is_written(kind) {
+            ro.retain(|k| k != &key);
+            if !rw.contains(&key) {
+                rw.push(key);
+            }
+        } else if !rw.contains(&key) && !ro.contains(&key) {
+            ro.push(key);
+        }
+    }
+
+    fp.read_only = VecM::try_from(ro).expect("read_only footprint bound");
+    fp.read_write = VecM::try_from(rw).expect("read_write footprint bound");
     fp
 }
 
@@ -631,6 +755,7 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
         seq,
         invoke_op(&invocation, auth),
         &args.guard,
+        call.kind(),
     );
     let sim = rpc.simulate(&b64_encode_xdr(&env));
 
@@ -679,31 +804,12 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
     }
 }
 
-/// The guard storage keys `__check_auth` reads. Declaring them in the *first*
-/// (preflight) envelope's footprint makes the RPC price them into
-/// `transactionData`/`minResourceFee`; merging them only after pricing breaks
-/// protocol-28 fee accounting (core recomputes the resource fee from the
-/// declared footprint, so extra read-write keys with an unpriced
-/// `resourceFee` fail with `insufficient_refundable_fee`).
-fn guard_footprint(guard: &ScAddress) -> LedgerFootprint {
-    let keys = vec![
-        guard_data_key(guard, "Policy"),
-        guard_data_key(guard, "Window"),
-        guard_data_key(guard, "LastHeartbeat"),
-        guard_data_key(guard, "AdminFrozen"),
-        guard_instance_key(guard),
-    ];
-    LedgerFootprint {
-        read_only: VecM::default(),
-        read_write: VecM::try_from(keys).expect("footprint bound"),
-    }
-}
-
 fn build_initial_envelope(
     source: &MuxedAccount,
     seq: i64,
     op: Operation,
     guard: &ScAddress,
+    kind: CallKind,
 ) -> TransactionEnvelope {
     let tx = Transaction {
         source_account: source.clone(),
@@ -714,7 +820,7 @@ fn build_initial_envelope(
         operations: VecM::try_from(vec![op]).expect("op count"),
         ext: TransactionExt::V1(SorobanTransactionData {
             resources: SorobanResources {
-                footprint: guard_footprint(guard),
+                footprint: guard_footprint(guard, kind),
                 instructions: 0,
                 disk_read_bytes: 0,
                 write_bytes: 0,
@@ -835,6 +941,13 @@ enum Call {
 }
 
 impl Call {
+    fn kind(&self) -> CallKind {
+        match self {
+            Self::Transfer { .. } | Self::TransferFrom { .. } => CallKind::Transfer,
+            Self::Heartbeat => CallKind::Heartbeat,
+        }
+    }
+
     /// The exact `InvokeContractArgs` the host will authorize — the same args
     /// go into the operation and into the auth entry's root invocation.
     fn invocation(&self, guard: &ScAddress) -> InvokeContractArgs {
@@ -920,7 +1033,13 @@ fn run(call: &Call, args: &Args) {
     // `__check_auth` touched; the merge below is a safety net for any key the
     // preflight could not see.
     let op = invoke_op(&invocation, auth.clone());
-    let env0 = build_initial_envelope(&MuxedAccount::Ed25519(Uint256(source_pk)), seq, op, guard);
+    let env0 = build_initial_envelope(
+        &MuxedAccount::Ed25519(Uint256(source_pk)),
+        seq,
+        op,
+        guard,
+        call.kind(),
+    );
     let sim = args.rpc.simulate(&b64_encode_xdr(&env0));
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!(
@@ -976,12 +1095,20 @@ fn run(call: &Call, args: &Args) {
     // fee. They ARE read at apply time (enforcing mode), so they must be in
     // the declared footprint — and the declared `resource_fee` must cover the
     // enlarged footprint or core fails with `insufficient_refundable_fee`.
-    let merged = merge_guard_footprint(data.resources.footprint.clone(), guard);
-    let added = merged.read_write.len() - data.resources.footprint.read_write.len();
+    let merged = merge_guard_footprint(data.resources.footprint.clone(), guard, call.kind());
+    let added_rw = merged
+        .read_write
+        .len()
+        .saturating_sub(data.resources.footprint.read_write.len());
+    let added_ro = merged
+        .read_only
+        .len()
+        .saturating_sub(data.resources.footprint.read_only.len());
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!(
-            "footprint merge added {added} keys (sim had {})",
-            data.resources.footprint.read_write.len()
+            "footprint merge added {added_rw} rw / {added_ro} ro keys (sim had {} rw, {} ro)",
+            data.resources.footprint.read_write.len(),
+            data.resources.footprint.read_only.len(),
         );
     }
     // Cover the extra write entries (~few hundred stroops each) plus headroom
@@ -1136,12 +1263,7 @@ fn verify_guard(rpc: &Rpc, guard_addr: &str, _passphrase: &str) -> Result<(), St
     let guard: ScAddress = guard_addr
         .parse()
         .map_err(|e| format!("invalid guard address: {e}"))?;
-    let env = guard_footprint(&guard);
-    let keys = env.read_write.iter().cloned().collect::<Vec<_>>();
-    let fp = LedgerFootprint {
-        read_only: VecM::default(),
-        read_write: VecM::try_from(keys).expect("footprint bound"),
-    };
+    let fp = guard_footprint(&guard, CallKind::ReadOnly);
     let tx = Transaction {
         source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
         fee: 0,
@@ -2482,6 +2604,147 @@ mod tests {
         assert!(err.contains("--guard"), "{err}");
         assert!(err.contains("--agent-secret"), "{err}");
     }
+
+    #[test]
+    fn guard_footprint_transfer_splits_read_only_and_read_write() {
+        let guard: ScAddress = VALID_GUARD.parse().expect("valid guard");
+        let fp = guard_footprint(&guard, CallKind::Transfer);
+
+        let rw_keys = fp.read_write.to_vec();
+        let ro_keys = fp.read_only.to_vec();
+
+        // Transfer writes Window and Instance key (engine TTL)
+        assert_eq!(rw_keys.len(), 2);
+        assert!(rw_keys.contains(&guard_data_key(&guard, "Window")));
+        assert!(rw_keys.contains(&guard_instance_key(&guard)));
+
+        // Transfer only reads Policy, AdminFrozen, and LastHeartbeat
+        assert_eq!(ro_keys.len(), 3);
+        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+
+        // Read-only and read-write sets must be disjoint
+        for key in &ro_keys {
+            assert!(
+                !rw_keys.contains(key),
+                "key in both read-only and read-write: {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_footprint_heartbeat_splits_read_only_and_read_write() {
+        let guard: ScAddress = VALID_GUARD.parse().expect("valid guard");
+        let fp = guard_footprint(&guard, CallKind::Heartbeat);
+
+        let rw_keys = fp.read_write.to_vec();
+        let ro_keys = fp.read_only.to_vec();
+
+        // Heartbeat writes LastHeartbeat and Instance key (engine TTL)
+        assert_eq!(rw_keys.len(), 2);
+        assert!(rw_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(rw_keys.contains(&guard_instance_key(&guard)));
+
+        // Heartbeat only reads Policy, AdminFrozen, and Window
+        assert_eq!(ro_keys.len(), 3);
+        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, "Window")));
+
+        // Read-only and read-write sets must be disjoint
+        for key in &ro_keys {
+            assert!(
+                !rw_keys.contains(key),
+                "key in both read-only and read-write: {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_footprint_read_only_split() {
+        let guard: ScAddress = VALID_GUARD.parse().expect("valid guard");
+        let fp = guard_footprint(&guard, CallKind::ReadOnly);
+
+        let rw_keys = fp.read_write.to_vec();
+        let ro_keys = fp.read_only.to_vec();
+
+        // Read-only diagnostic writes only Instance key (TTL)
+        assert_eq!(rw_keys.len(), 1);
+        assert!(rw_keys.contains(&guard_instance_key(&guard)));
+
+        // All persistent keys are in read-only
+        assert_eq!(ro_keys.len(), 4);
+        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, "Window")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+    }
+
+    #[test]
+    fn merge_guard_footprint_splits_keys_correctly() {
+        let guard: ScAddress = VALID_GUARD.parse().expect("valid guard");
+        let empty_fp = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: VecM::default(),
+        };
+
+        // Merge onto empty footprint matches guard_footprint
+        let transfer_merged = merge_guard_footprint(empty_fp.clone(), &guard, CallKind::Transfer);
+        assert_eq!(transfer_merged.read_write.len(), 2);
+        assert_eq!(transfer_merged.read_only.len(), 3);
+        assert!(transfer_merged
+            .read_write
+            .contains(&guard_data_key(&guard, "Window")));
+        assert!(transfer_merged
+            .read_only
+            .contains(&guard_data_key(&guard, "LastHeartbeat")));
+
+        let heartbeat_merged = merge_guard_footprint(empty_fp, &guard, CallKind::Heartbeat);
+        assert_eq!(heartbeat_merged.read_write.len(), 2);
+        assert_eq!(heartbeat_merged.read_only.len(), 3);
+        assert!(heartbeat_merged
+            .read_write
+            .contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(heartbeat_merged
+            .read_only
+            .contains(&guard_data_key(&guard, "Window")));
+
+        // Merge onto simulated footprint that already has token contract keys
+        let token_addr: ScAddress = VALID_TOKEN.parse().expect("valid token");
+        let token_rw = guard_data_key(&token_addr, "Balance");
+        let simulated_fp = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: VecM::try_from(vec![token_rw.clone()]).expect("bound"),
+        };
+
+        let merged = merge_guard_footprint(simulated_fp, &guard, CallKind::Transfer);
+        assert!(merged.read_write.contains(&token_rw));
+        assert!(merged
+            .read_write
+            .contains(&guard_data_key(&guard, "Window")));
+        assert_eq!(merged.read_write.len(), 3); // token_rw + Window + Instance
+        assert_eq!(merged.read_only.len(), 3); // Policy + AdminFrozen + LastHeartbeat
+    }
+
+    #[test]
+    fn footprint_reduces_write_entries_preventing_rent_inflation() {
+        let guard: ScAddress = VALID_GUARD.parse().expect("valid guard");
+
+        // Prior to splitting, every guard key (5 keys) was declared read-write.
+        let legacy_write_keys_count = 5;
+
+        // With the split, only written keys + instance key are declared read-write (2 keys).
+        let transfer_fp = guard_footprint(&guard, CallKind::Transfer);
+        let heartbeat_fp = guard_footprint(&guard, CallKind::Heartbeat);
+
+        assert_eq!(transfer_fp.read_write.len(), 2);
+        assert_eq!(heartbeat_fp.read_write.len(), 2);
+
+        // 3 keys saved from read-write declaration per transaction (60% write rent reduction)
+        assert_eq!(legacy_write_keys_count - transfer_fp.read_write.len(), 3);
+        assert_eq!(legacy_write_keys_count - heartbeat_fp.read_write.len(), 3);
+    }
 }
 
 fn map_submission_error(err_str: &str) -> String {
@@ -3314,7 +3577,13 @@ fn cmd_check(
     let seq = 0i64;
 
     let op = invoke_op(&invocation, VecM::default());
-    let env = build_initial_envelope(&MuxedAccount::Ed25519(Uint256(source_pk)), seq, op, guard);
+    let env = build_initial_envelope(
+        &MuxedAccount::Ed25519(Uint256(source_pk)),
+        seq,
+        op,
+        guard,
+        CallKind::Transfer,
+    );
 
     let sim = rpc.simulate(&b64_encode_xdr(&env));
 
