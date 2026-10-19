@@ -2365,6 +2365,123 @@ mod tests {
         assert!(err.contains("--from"), "{err}");
         assert!(err.contains("expected account ID"), "{err}");
     }
+
+    #[test]
+    fn parser_accepts_valid_transfer() {
+        let args = argv(&[
+            "transfer",
+            "--guard",
+            VALID_GUARD,
+            "--token",
+            VALID_TOKEN,
+            "--to",
+            VALID_RECIPIENT,
+            "--amount",
+            "100",
+            "--agent-secret",
+            VALID_SECRET,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let req = parse_request("transfer", rest).expect("valid transfer request");
+        assert_eq!(req.amount, Some(100));
+        assert!(req.token.is_some());
+        assert!(req.to.is_some());
+        assert_eq!(req.secret, Some(VALID_SECRET.to_string()));
+    }
+
+    #[test]
+    fn parser_accepts_valid_heartbeat() {
+        let args = argv(&[
+            "heartbeat",
+            "--guard",
+            VALID_GUARD,
+            "--agent-secret",
+            VALID_SECRET,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let req = parse_request("heartbeat", rest).expect("valid heartbeat request");
+        assert_eq!(req.amount, None);
+        assert_eq!(req.token, None);
+        assert_eq!(req.to, None);
+        assert_eq!(req.secret, Some(VALID_SECRET.to_string()));
+    }
+
+    #[test]
+    fn parser_rejects_heartbeat_with_transfer_flags() {
+        // --token passed to heartbeat
+        let args = argv(&[
+            "heartbeat",
+            "--guard",
+            VALID_GUARD,
+            "--agent-secret",
+            VALID_SECRET,
+            "--token",
+            VALID_TOKEN,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("heartbeat", rest).expect_err("heartbeat with --token rejected");
+        assert!(
+            err.contains("transfer-only flag '--token' is not valid for `heartbeat`"),
+            "{err}"
+        );
+        assert!(err.contains("valid flags:"), "{err}");
+
+        // --amount passed to heartbeat
+        let args = argv(&[
+            "heartbeat",
+            "--guard",
+            VALID_GUARD,
+            "--agent-secret",
+            VALID_SECRET,
+            "--amount",
+            "50",
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("heartbeat", rest).expect_err("heartbeat with --amount rejected");
+        assert!(
+            err.contains("transfer-only flag '--amount' is not valid for `heartbeat`"),
+            "{err}"
+        );
+
+        // --to passed to heartbeat
+        let args = argv(&[
+            "heartbeat",
+            "--guard",
+            VALID_GUARD,
+            "--agent-secret",
+            VALID_SECRET,
+            "--to",
+            VALID_RECIPIENT,
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("heartbeat", rest).expect_err("heartbeat with --to rejected");
+        assert!(
+            err.contains("transfer-only flag '--to' is not valid for `heartbeat`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_unknown_flags_with_diagnostic_listing_valid_flags() {
+        let args = argv(&[
+            "heartbeat",
+            "--guard",
+            VALID_GUARD,
+            "--agent-secret",
+            VALID_SECRET,
+            "--unknown-custom-flag",
+            "foo",
+        ]);
+        let (_, rest) = args.split_first().expect("subcommand");
+        let err = parse_request("heartbeat", rest).expect_err("unknown flag rejected");
+        assert!(
+            err.contains("unknown argument for `heartbeat`: --unknown-custom-flag"),
+            "{err}"
+        );
+        assert!(err.contains("valid flags:"), "{err}");
+        assert!(err.contains("--guard"), "{err}");
+        assert!(err.contains("--agent-secret"), "{err}");
+    }
 }
 
 fn map_submission_error(err_str: &str) -> String {
@@ -2391,6 +2508,104 @@ struct Cli<'a> {
     pos: usize,
 }
 
+/// The valid flags recognized by each subcommand.
+fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
+    match cmd {
+        "preflight" => &[
+            "--guard",
+            "--asset",
+            "--token",
+            "--to",
+            "--amount",
+            "--secret",
+            "--agent-secret",
+            "--network",
+            "--rpc-url",
+            "--network-passphrase",
+            "--inclusion-fee",
+            "--expect-blocked",
+            "-h",
+            "--help",
+        ],
+        "transfer" => &[
+            "--guard",
+            "--token",
+            "--asset",
+            "--to",
+            "--amount",
+            "--agent-secret",
+            "--secret",
+            "--network",
+            "--rpc-url",
+            "--network-passphrase",
+            "--inclusion-fee",
+            "--expect-blocked",
+            "-h",
+            "--help",
+        ],
+        "transfer-from" => &[
+            "--guard",
+            "--token",
+            "--asset",
+            "--from",
+            "--to",
+            "--amount",
+            "--agent-secret",
+            "--secret",
+            "--network",
+            "--rpc-url",
+            "--network-passphrase",
+            "--inclusion-fee",
+            "--expect-blocked",
+            "-h",
+            "--help",
+        ],
+        "heartbeat" => &[
+            "--guard",
+            "--agent-secret",
+            "--secret",
+            "--network",
+            "--rpc-url",
+            "--network-passphrase",
+            "--inclusion-fee",
+            "-h",
+            "--help",
+        ],
+        "status" | "policy" => &[
+            "--guard",
+            "--network",
+            "--rpc-url",
+            "--network-passphrase",
+            "-h",
+            "--help",
+        ],
+        "check" => &[
+            "--guard",
+            "--asset",
+            "--token",
+            "--to",
+            "--amount",
+            "--network",
+            "--rpc-url",
+            "--network-passphrase",
+            "-h",
+            "--help",
+        ],
+        _ => &[],
+    }
+}
+
+/// Flags that are only valid for transfer subcommands and must be rejected
+/// if passed to non-transfer subcommands like `heartbeat`.
+const TRANSFER_ONLY_FLAGS: &[&str] = &[
+    "--token",
+    "--asset",
+    "--to",
+    "--from",
+    "--amount",
+    "--expect-blocked",
+];
+
 impl<'a> Cli<'a> {
     fn new(cmd: &'a str, argv: &'a [String]) -> Self {
         Self { cmd, argv, pos: 0 }
@@ -2416,10 +2631,19 @@ impl<'a> Cli<'a> {
     }
 
     fn unknown(&self, flag: &str) -> String {
-        format!(
-            "unknown argument for `{}`: {flag} (see `agent-tx --help` or `agent-tx {} --help`)",
-            self.cmd, self.cmd
-        )
+        let valid = valid_flags_for_subcommand(self.cmd);
+        if valid.is_empty() {
+            format!(
+                "unknown argument for `{}`: {flag} (see `agent-tx --help` or `agent-tx {} --help`)",
+                self.cmd, self.cmd
+            )
+        } else {
+            format!(
+                "unknown argument for `{}`: {flag}; valid flags: {}",
+                self.cmd,
+                valid.join(", ")
+            )
+        }
     }
 }
 
@@ -2501,7 +2725,25 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     let mut expect_blocked = false;
     let mut inclusion_fee_override = None;
 
+    let valid_flags = valid_flags_for_subcommand(cmd);
+
     while let Some(flag) = cli.next() {
+        if !valid_flags.contains(&flag.as_str()) {
+            if cmd == "heartbeat" && TRANSFER_ONLY_FLAGS.contains(&flag.as_str()) {
+                return Err(format!(
+                    "transfer-only flag '{flag}' is not valid for `heartbeat` (valid flags: {})",
+                    valid_flags.join(", ")
+                ));
+            }
+            if cmd == "transfer" && flag == "--from" {
+                return Err(format!(
+                    "flag '--from' is only valid for `transfer-from`, not `transfer` (valid flags: {})",
+                    valid_flags.join(", ")
+                ));
+            }
+            return Err(cli.unknown(&flag));
+        }
+
         match flag.as_str() {
             "-h" | "--help" => {
                 return Err(format!(
